@@ -20,6 +20,24 @@ mission_lock = threading.Lock()
 # lurch/drift backward instead of climbing cleanly.
 STABILIZE_AFTER_TAKEOFF = 4      # seconds
 MISSION_SPEED = 40               # cm/s for distance moves — gentler = more predictable
+MAX_MOVE_CHUNK = 100             # split big moves into ≤this many cm — large single hops are flaky
+MOVE_RETRIES   = 2               # retries (after a settle) on transient errors like 'No valid imu'
+RETRY_SETTLE   = 1.5             # seconds to let the IMU steady before a retry
+MIN_BATTERY    = 20              # refuse to start a mission below this %
+
+# Fallback for a stubborn 'No valid imu': precise move_* needs a valid position
+# estimate (IMU + downward vision); send_rc_control is open-loop velocity and does
+# not, so it usually still flies. Distance/angle become APPROXIMATE (time-based).
+USE_RC_FALLBACK = True            # set False to just abort instead of flying open-loop
+RC_SPEED        = 30             # rc throttle 0-100 for fallback moves (conservative)
+RC_CM_PER_S     = 30             # APPROX cm/sec at RC_SPEED  — TUNE to your drone
+RC_DEG_PER_S    = 45             # APPROX deg/sec at RC_SPEED — TUNE to your drone
+RC_AXES = {                      # direction -> (left_right, fwd_back, up_down, yaw) signs
+    "up": (0, 0, 1, 0),   "down": (0, 0, -1, 0),
+    "forward": (0, 1, 0, 0),  "back": (0, -1, 0, 0),
+    "left": (-1, 0, 0, 0),  "right": (1, 0, 0, 0),
+    "cw": (0, 0, 0, 1),   "ccw": (0, 0, 0, -1),
+}
 
 def log(msg):
     print(msg)
@@ -75,6 +93,44 @@ def validate_steps(steps):
             return f"step {i + 1}: flip needs l/r/f/b"
     return None
 
+def _rc_move(direction, amount, per_sec):
+    """Open-loop velocity move/turn via send_rc_control — bypasses the position
+    estimator that rejects precise commands with 'No valid imu'. Distance/angle is
+    APPROXIMATE (time-based), so tune RC_CM_PER_S / RC_DEG_PER_S to your drone."""
+    lr, fb, ud, yaw = RC_AXES[direction]
+    s = RC_SPEED
+    dur = amount / max(1, per_sec)
+    log(f"  rc-fallback {direction} ~{amount} (~{dur:.1f}s @ rc{s})")
+    end = time.time() + dur
+    while time.time() < end:
+        if mission_status.get("cancel"):
+            return                                # operator stop — let land take over
+        tello.send_rc_control(lr * s, fb * s, ud * s, yaw * s)
+        time.sleep(0.05)
+    tello.send_rc_control(0, 0, 0, 0)             # normal finish: stop & hover
+
+def _do_with_retry(direction, amount, per_sec):
+    """Precise move/rotate with settle-and-retry on transient errors, then (if
+    enabled) an open-loop rc fallback so a stubborn 'No valid imu' that calibration
+    can't fix doesn't kill the mission. Re-raises if the fallback is disabled."""
+    precise = MOVE_CMDS.get(direction) or ROTATE_CMDS.get(direction)
+    for attempt in range(MOVE_RETRIES + 1):
+        try:
+            precise(amount)
+            return
+        except Exception as e:
+            if mission_status.get("cancel"):
+                raise
+            if attempt < MOVE_RETRIES:
+                log(f"  {direction} {amount} failed: {e} — settle {RETRY_SETTLE}s & retry")
+                time.sleep(RETRY_SETTLE)
+            elif USE_RC_FALLBACK:
+                log(f"  {direction} {amount} still refused ({e}) — open-loop rc fallback")
+                _rc_move(direction, amount, per_sec)
+                return
+            else:
+                raise
+
 def exec_step(step):
     t = step.get("type")
     v = step.get("value")
@@ -85,9 +141,18 @@ def exec_step(step):
     elif t == "emergency":
         tello.emergency()          # cuts motors immediately — drone drops
     elif t in MOVE_CMDS:
-        MOVE_CMDS[t](max(20, min(500, int(float(v)))))    # Tello range 20-500 cm
+        dist = max(20, min(500, int(float(v))))           # Tello range 20-500 cm
+        # split into even hops of ≤MAX_MOVE_CHUNK; each hop re-stabilizes (IMU-friendly)
+        n = (dist + MAX_MOVE_CHUNK - 1) // MAX_MOVE_CHUNK
+        base, extra = divmod(dist, n)
+        for k in range(n):
+            if mission_status.get("cancel"):
+                return
+            _do_with_retry(t, base + (1 if k < extra else 0), RC_CM_PER_S)
+            if k < n - 1:
+                time.sleep(0.4)                            # brief settle between hops
     elif t in ROTATE_CMDS:
-        ROTATE_CMDS[t](max(1, min(360, int(float(v)))))   # 1-360 deg
+        _do_with_retry(t, max(1, min(360, int(float(v)))), RC_DEG_PER_S)   # 1-360 deg
     elif t == "flip":
         if v not in FLIP_DIRS:
             raise ValueError(f"bad flip dir '{v}'")
@@ -118,6 +183,14 @@ def run_mission(steps):
         mission_status["log"] = []
         mission_status["current"] = -1
         log(f"Mission start — {len(steps)} step(s)")
+        try:
+            batt = tello.get_battery()
+            log(f"Battery {batt}%")
+            if batt < MIN_BATTERY:
+                log(f"Battery < {MIN_BATTERY}% — aborting. Charge before flying.")
+                return
+        except Exception as e:
+            log(f"battery check failed: {e}")
         try:
             tello.set_speed(MISSION_SPEED)            # gentle, predictable moves
         except Exception:
