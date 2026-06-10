@@ -12,8 +12,14 @@ tello.streamon()
 frame_reader = tello.get_frame_read()
 
 # ---- Mission engine -------------------------------------------------------
-mission_status = {"running": False, "log": [], "current": -1}
+mission_status = {"running": False, "log": [], "current": -1, "cancel": False}
 mission_lock = threading.Lock()
+
+# Let the drone settle after takeoff before the next move so the climb is stable.
+# Firing a move ~0.3s after takeoff (before position hold locks) is what makes it
+# lurch/drift backward instead of climbing cleanly.
+STABILIZE_AFTER_TAKEOFF = 4      # seconds
+MISSION_SPEED = 40               # cm/s for distance moves — gentler = more predictable
 
 def log(msg):
     print(msg)
@@ -31,7 +37,7 @@ ROTATE_CMDS = {
     "cw": tello.rotate_clockwise, "ccw": tello.rotate_counter_clockwise,
 }
 FLIP_DIRS = {"l", "r", "f", "b"}
-ALL_TYPES = set(MOVE_CMDS) | set(ROTATE_CMDS) | {"flip", "wait", "takeoff", "land"}
+ALL_TYPES = set(MOVE_CMDS) | set(ROTATE_CMDS) | {"flip", "wait", "takeoff", "land", "emergency"}
 
 LABELS = {
     "takeoff": "Takeoff", "land": "Land", "up": "Up", "down": "Down",
