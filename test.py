@@ -407,7 +407,7 @@ def index():
 
                 <button class="btn-mission" id="missionBtn" onclick="runMission()">▶ Run Mission</button>
                 <div style="display:flex;gap:8px;margin-top:8px;">
-                    <button class="btn" style="flex:1" onclick="loadSquare()">↺ Square preset</button>
+                    <button class="btn" style="flex:1" onclick="loadSquare()">▢ Square (air)</button>
                     <button class="btn" style="flex:1" onclick="clearSteps()">✕ Clear</button>
                 </div>
 
@@ -532,12 +532,14 @@ def index():
         }
         function clearSteps() { steps = []; renderSteps(-1); }
 
+        // Auto mission: takeoff → climb 200cm → trace a 200cm square (turning left) → descend → land
         function loadSquare() {
-            steps = [ {type:'takeoff'}, {type:'up',value:100} ];
+            steps = [ {type:'takeoff'}, {type:'up', value:200} ];
             for (let i = 0; i < 4; i++) {
-                steps.push({type:'forward', value:100});
-                steps.push({type:'ccw', value:90});
+                steps.push({type:'forward', value:200});
+                if (i < 3) steps.push({type:'ccw', value:90});   // turn left at the first 3 corners
             }
+            steps.push({type:'down', value:200});
             steps.push({type:'land'});
             renderSteps(-1);
         }
