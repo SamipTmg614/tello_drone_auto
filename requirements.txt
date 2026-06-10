@@ -1,0 +1,4 @@
+# Dependencies for test.py (Tello drone dashboard)
+djitellopy      # Tello drone control SDK (provides `from djitellopy import Tello`)
+flask           # Web server / dashboard (Flask, Response, jsonify)
+opencv-python   # Video frame handling (provides `cv2`)

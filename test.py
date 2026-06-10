@@ -35,9 +35,16 @@ def run_mission():
         tello.move_up(500)
         time.sleep(4)
 
-        log("Moving forward 500 cm (5 m)...")
-        tello.move_forward(500)
-        time.sleep(4)
+        # Fly a square, turning LEFT at each corner (first turn is left)
+        side = 100  # cm per side
+        for i in range(4):
+            log(f"Square side {i + 1}/4: forward {side} cm...")
+            tello.move_forward(side)
+            time.sleep(3)
+
+            log(f"Corner {i + 1}/4: turning left 90 deg...")
+            tello.rotate_counter_clockwise(90)
+            time.sleep(2)
 
         log("Landing...")
         tello.land()
@@ -225,7 +232,7 @@ def index():
             <div class="mission-steps">
                 <div class="step"><div class="step-icon">🛫</div> Takeoff</div>
                 <div class="step"><div class="step-icon">⬆️</div> Ascend 5 m</div>
-                <div class="step"><div class="step-icon">➡️</div> Forward 5 m</div>
+                <div class="step"><div class="step-icon">↩️</div> Square (turn left)</div>
                 <div class="step"><div class="step-icon">🛬</div> Land</div>
             </div>
 
