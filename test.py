@@ -452,7 +452,7 @@ def index():
                     move <input type="number" id="manualDist" value="30" min="20" max="500"> cm
                     · turn <input type="number" id="manualAng" value="45" min="1" max="360"> °
                 </div>
-                <div class="kbd-hint">keys: T takeoff · G land · W/S fwd/back · A/D left/right · R/F up/down · Q/E rotate</div>
+                <div class="kbd-hint">keys: T takeoff · G land/abort · W/S fwd/back · A/D left/right · R/F up/down · Q/E rotate<br>Land &amp; Emergency work during a mission; other manual moves are paused while it runs.</div>
             </div>
 
             <div class="panel">
@@ -630,6 +630,15 @@ def index():
                 const d = await res.json().catch(() => ({}));
                 alert(d.msg || 'mission error');
             }
+        }
+
+        // Emergency stop — works whether or not a mission is running (backend aborts + lands).
+        async function emergencyLand() {
+            try { await fetch('/control/land', { method: 'POST' }); } catch (e) {}
+        }
+        async function emergencyCut() {
+            if (!confirm('CUT MOTORS now? The drone will DROP immediately.')) return;
+            try { await fetch('/control/emergency', { method: 'POST' }); } catch (e) {}
         }
 
         async function pollMission() {
