@@ -43,6 +43,7 @@ LABELS = {
     "takeoff": "Takeoff", "land": "Land", "up": "Up", "down": "Down",
     "forward": "Forward", "back": "Back", "left": "Left", "right": "Right",
     "cw": "Rotate CW", "ccw": "Rotate CCW", "flip": "Flip", "wait": "Wait",
+    "emergency": "EMERGENCY",
 }
 
 def step_desc(step):
@@ -81,6 +82,8 @@ def exec_step(step):
         tello.takeoff()
     elif t == "land":
         tello.land()
+    elif t == "emergency":
+        tello.emergency()          # cuts motors immediately — drone drops
     elif t in MOVE_CMDS:
         MOVE_CMDS[t](max(20, min(500, int(float(v)))))    # Tello range 20-500 cm
     elif t in ROTATE_CMDS:
@@ -94,31 +97,61 @@ def exec_step(step):
     else:
         raise ValueError(f"unknown step '{t}'")
 
+def abort_mission(stop_cmd="land"):
+    """Signal a running mission to stop and immediately fire a stop command to
+    the drone WITHOUT waiting for a response — so it works even while the mission
+    thread is blocked mid-move. Backs the emergency Land button."""
+    mission_status["cancel"] = True
+    try:
+        tello.send_command_without_return(stop_cmd)   # 'land' (controlled) or 'emergency' (motor cut)
+        log(f"!! Operator override: {stop_cmd.upper()}")
+    except Exception as e:
+        log(f"abort send failed: {e}")
+
 def run_mission(steps):
     if not mission_lock.acquire(blocking=False):
         log("Mission already running.")
         return
     try:
         mission_status["running"] = True
+        mission_status["cancel"] = False
         mission_status["log"] = []
         mission_status["current"] = -1
         log(f"Mission start — {len(steps)} step(s)")
+        try:
+            tello.set_speed(MISSION_SPEED)            # gentle, predictable moves
+        except Exception:
+            pass
         for i, step in enumerate(steps):
+            if mission_status["cancel"]:
+                log("Mission aborted by operator.")
+                break
             mission_status["current"] = i
             log(f"[{i + 1}/{len(steps)}] {step_desc(step)}")
             exec_step(step)
+            # settle after takeoff so the next move (the climb) is stable, not a lurch
+            if step.get("type") == "takeoff":
+                log(f"stabilizing {STABILIZE_AFTER_TAKEOFF}s...")
+                time.sleep(STABILIZE_AFTER_TAKEOFF)
+            if mission_status["cancel"]:
+                log("Mission aborted by operator.")
+                break
             time.sleep(0.3)
-        log("Mission complete.")
+        else:
+            log("Mission complete.")
     except Exception as e:
         log(f"Mission error: {e}")
-        try:
-            tello.land()
-            log("Emergency land.")
-        except Exception:
-            pass
+        # don't fight an operator stop — only auto-land if no abort was requested
+        if not mission_status["cancel"]:
+            try:
+                tello.land()
+                log("Auto-land after error.")
+            except Exception:
+                pass
     finally:
         mission_status["current"] = -1
         mission_status["running"] = False
+        mission_status["cancel"] = False
         mission_lock.release()
 
 def gen_frames():
@@ -162,12 +195,30 @@ def start_mission():
     threading.Thread(target=run_mission, args=(steps,), daemon=True).start()
     return jsonify({"status": "started"})
 
+@app.route('/mission/abort', methods=['POST'])
+def abort_route():
+    if not mission_status["running"]:
+        return jsonify({"status": "idle", "msg": "no mission running"})
+    abort_mission("land")
+    return jsonify({"status": "aborting"})
+
 @app.route('/control/<cmd>', methods=['POST'])
 def control(cmd):
     if cmd not in ALL_TYPES:
         return jsonify({"status": "error", "msg": f"unknown cmd '{cmd}'"}), 400
+    # Safety override: Land / Emergency may interrupt a running mission at ANY time.
+    if cmd in ("land", "emergency"):
+        if mission_status["running"]:
+            abort_mission(cmd)
+            return jsonify({"status": "aborting", "msg": f"{cmd} sent — mission aborting"})
+        try:
+            exec_step({"type": cmd})                # not in a mission: normal blocking land
+            return jsonify({"status": "ok"})
+        except Exception as e:
+            return jsonify({"status": "error", "msg": str(e)}), 500
+    # Every other manual command is blocked while a mission is running.
     if mission_status["running"]:
-        return jsonify({"status": "busy", "msg": "mission running"}), 409
+        return jsonify({"status": "busy", "msg": "mission running — only Land/Emergency allowed"}), 409
     v = request.args.get("value")
     step = {"type": cmd}
     if cmd in MOVE_CMDS:
@@ -270,6 +321,22 @@ def index():
         }
         .btn-mission:hover  { background:#1d4ed8; }
         .btn-mission:disabled { background:#1e3a6e; color:#555; cursor:not-allowed; }
+
+        /* always-on safety controls */
+        .btn-emergency {
+            margin-top:10px; width:100%; padding:14px;
+            background:#dc2626; color:#fff; border:none; border-radius:8px;
+            font-size:15px; font-weight:700; letter-spacing:0.04em; cursor:pointer;
+            transition:background .15s;
+        }
+        .btn-emergency:hover  { background:#b91c1c; }
+        .btn-emergency:active { background:#991b1b; }
+        .btn-cut {
+            margin-top:6px; width:100%; padding:8px;
+            background:#3a0d0d; color:#f87171; border:1px solid #7f1d1d;
+            border-radius:8px; font-size:12px; font-weight:600; cursor:pointer;
+        }
+        .btn-cut:hover { background:#511414; }
 
         .log-box {
             background:#0d0d0d;
@@ -416,6 +483,8 @@ def index():
                     <button class="btn" style="flex:1" onclick="loadSquare()">▢ Square (air)</button>
                     <button class="btn" style="flex:1" onclick="clearSteps()">✕ Clear</button>
                 </div>
+                <button class="btn-emergency" onclick="emergencyLand()">🛬 EMERGENCY LAND</button>
+                <button class="btn-cut" onclick="emergencyCut()">⛔ Cut motors (drone drops)</button>
 
                 <div style="margin-top:12px;">
                     <div style="font-size:11px;color:#555;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.08em;">
