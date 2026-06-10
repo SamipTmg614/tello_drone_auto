@@ -1,5 +1,5 @@
 from djitellopy import Tello
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 import cv2
 import threading
 import time
@@ -11,54 +11,109 @@ tello.connect()
 tello.streamon()
 frame_reader = tello.get_frame_read()
 
-# Mission state
-mission_status = {"running": False, "log": []}
+# ---- Mission engine -------------------------------------------------------
+mission_status = {"running": False, "log": [], "current": -1}
+mission_lock = threading.Lock()
 
 def log(msg):
     print(msg)
     mission_status["log"].append(msg)
-    if len(mission_status["log"]) > 20:
+    if len(mission_status["log"]) > 40:
         mission_status["log"].pop(0)
 
-def run_mission():
-    if mission_status["running"]:
+# command tables: map a step "type" to the drone action
+MOVE_CMDS = {
+    "up": tello.move_up, "down": tello.move_down,
+    "forward": tello.move_forward, "back": tello.move_back,
+    "left": tello.move_left, "right": tello.move_right,
+}
+ROTATE_CMDS = {
+    "cw": tello.rotate_clockwise, "ccw": tello.rotate_counter_clockwise,
+}
+FLIP_DIRS = {"l", "r", "f", "b"}
+ALL_TYPES = set(MOVE_CMDS) | set(ROTATE_CMDS) | {"flip", "wait", "takeoff", "land"}
+
+LABELS = {
+    "takeoff": "Takeoff", "land": "Land", "up": "Up", "down": "Down",
+    "forward": "Forward", "back": "Back", "left": "Left", "right": "Right",
+    "cw": "Rotate CW", "ccw": "Rotate CCW", "flip": "Flip", "wait": "Wait",
+}
+
+def step_desc(step):
+    t = step.get("type")
+    v = step.get("value")
+    label = LABELS.get(t, t)
+    if t in ("takeoff", "land"):
+        return label
+    if t == "flip":
+        return f"{label} {v}"
+    if t == "wait":
+        return f"{label} {v}s"
+    unit = "deg" if t in ROTATE_CMDS else "cm"
+    return f"{label} {v}{unit}"
+
+def validate_steps(steps):
+    if not isinstance(steps, list) or not steps:
+        return "no steps"
+    for i, s in enumerate(steps):
+        t = s.get("type") if isinstance(s, dict) else None
+        if t not in ALL_TYPES:
+            return f"step {i + 1}: unknown type '{t}'"
+        if t in MOVE_CMDS or t in ROTATE_CMDS or t == "wait":
+            try:
+                float(s.get("value"))
+            except (TypeError, ValueError):
+                return f"step {i + 1}: '{t}' needs a number"
+        if t == "flip" and s.get("value") not in FLIP_DIRS:
+            return f"step {i + 1}: flip needs l/r/f/b"
+    return None
+
+def exec_step(step):
+    t = step.get("type")
+    v = step.get("value")
+    if t == "takeoff":
+        tello.takeoff()
+    elif t == "land":
+        tello.land()
+    elif t in MOVE_CMDS:
+        MOVE_CMDS[t](max(20, min(500, int(float(v)))))    # Tello range 20-500 cm
+    elif t in ROTATE_CMDS:
+        ROTATE_CMDS[t](max(1, min(360, int(float(v)))))   # 1-360 deg
+    elif t == "flip":
+        if v not in FLIP_DIRS:
+            raise ValueError(f"bad flip dir '{v}'")
+        tello.flip(v)
+    elif t == "wait":
+        time.sleep(float(v))
+    else:
+        raise ValueError(f"unknown step '{t}'")
+
+def run_mission(steps):
+    if not mission_lock.acquire(blocking=False):
         log("Mission already running.")
         return
-    mission_status["running"] = True
-    mission_status["log"] = []
     try:
-        log("Takeoff...")
-        tello.takeoff()
-        time.sleep(3)
-
-        log("Ascending to 500 cm (5 m)...")
-        tello.move_up(500)
-        time.sleep(4)
-
-        # Fly a square, turning LEFT at each corner (first turn is left)
-        side = 100  # cm per side
-        for i in range(4):
-            log(f"Square side {i + 1}/4: forward {side} cm...")
-            tello.move_forward(side)
-            time.sleep(3)
-
-            log(f"Corner {i + 1}/4: turning left 90 deg...")
-            tello.rotate_counter_clockwise(90)
-            time.sleep(2)
-
-        log("Landing...")
-        tello.land()
-        time.sleep(3)
-
+        mission_status["running"] = True
+        mission_status["log"] = []
+        mission_status["current"] = -1
+        log(f"Mission start — {len(steps)} step(s)")
+        for i, step in enumerate(steps):
+            mission_status["current"] = i
+            log(f"[{i + 1}/{len(steps)}] {step_desc(step)}")
+            exec_step(step)
+            time.sleep(0.3)
         log("Mission complete.")
     except Exception as e:
         log(f"Mission error: {e}")
         try:
             tello.land()
-        except:
+            log("Emergency land.")
+        except Exception:
             pass
     finally:
+        mission_status["current"] = -1
         mission_status["running"] = False
+        mission_lock.release()
 
 def gen_frames():
     while True:
@@ -91,15 +146,42 @@ def stats():
 
 @app.route('/mission/start', methods=['POST'])
 def start_mission():
-    t = threading.Thread(target=run_mission, daemon=True)
-    t.start()
+    if mission_status["running"]:
+        return jsonify({"status": "busy", "msg": "mission already running"}), 409
+    data = request.get_json(silent=True) or {}
+    steps = data.get("steps", [])
+    err = validate_steps(steps)
+    if err:
+        return jsonify({"status": "error", "msg": err}), 400
+    threading.Thread(target=run_mission, args=(steps,), daemon=True).start()
     return jsonify({"status": "started"})
+
+@app.route('/control/<cmd>', methods=['POST'])
+def control(cmd):
+    if cmd not in ALL_TYPES:
+        return jsonify({"status": "error", "msg": f"unknown cmd '{cmd}'"}), 400
+    if mission_status["running"]:
+        return jsonify({"status": "busy", "msg": "mission running"}), 409
+    v = request.args.get("value")
+    step = {"type": cmd}
+    if cmd in MOVE_CMDS:
+        step["value"] = v if v is not None else 30
+    elif cmd in ROTATE_CMDS:
+        step["value"] = v if v is not None else 45
+    elif cmd == "flip":
+        step["value"] = v or "f"
+    try:
+        exec_step(step)
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "msg": str(e)}), 500
 
 @app.route('/mission/status')
 def mission_status_route():
     return jsonify({
         "running": mission_status["running"],
-        "log": mission_status["log"]
+        "log": mission_status["log"],
+        "current": mission_status["current"],
     })
 
 @app.route('/')
@@ -131,7 +213,7 @@ def index():
         .card .value { font-size:24px; font-weight:600; color:#fff; }
         .card .unit  { font-size:12px; color:#555; margin-left:3px; }
 
-        .layout { display:grid; grid-template-columns:1fr 340px; gap:16px; }
+        .layout { display:grid; grid-template-columns:1fr 380px; gap:16px; align-items:start; }
 
         img { width:100%; border-radius:10px; border:1px solid #222; display:block; }
 
@@ -207,6 +289,52 @@ def index():
         }
         .status-dot.running { background:#f59e0b; animation:pulse 1s infinite; }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+        /* side column: stacked panels */
+        .side-col { display:flex; flex-direction:column; gap:16px; }
+        .panel { background:#161616; border:1px solid #222; border-radius:10px; padding:16px; }
+        .panel h3 { font-size:13px; color:#666; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:12px; }
+
+        /* generic small button */
+        .btn { border:none; border-radius:6px; padding:8px 10px; font-size:13px; font-weight:600; cursor:pointer; color:#fff; background:#333; transition:background .15s; }
+        .btn:hover { background:#444; }
+        .btn-add { background:#374151; }
+        .btn-add:hover { background:#4b5563; }
+
+        /* manual control pad */
+        .pad { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+        .pad .btn { padding:11px 0; background:#1e1e1e; }
+        .pad .btn:hover { background:#2a2a2a; }
+        .pad .btn.takeoff { background:#166534; }
+        .pad .btn.takeoff:hover { background:#15803d; }
+        .pad .btn.land { background:#7f1d1d; }
+        .pad .btn.land:hover { background:#991b1b; }
+        .pad .spacer { visibility:hidden; }
+        .manual-val { display:flex; align-items:center; gap:8px; margin-top:10px; font-size:12px; color:#666; }
+        .manual-val input { width:60px; background:#0d0d0d; border:1px solid #2a2a2a; color:#e0e0e0; border-radius:6px; padding:6px; }
+        .kbd-hint { font-size:11px; color:#444; margin-top:10px; line-height:1.6; }
+
+        /* mission builder */
+        .builder-row { display:flex; gap:6px; margin-bottom:10px; }
+        .builder-row select, .builder-row input {
+            background:#0d0d0d; border:1px solid #2a2a2a; color:#e0e0e0;
+            border-radius:6px; padding:8px; font-size:13px;
+        }
+        .builder-row select { flex:1; min-width:0; }
+        .builder-row input { width:64px; }
+
+        .steps-list { display:flex; flex-direction:column; gap:6px; margin-bottom:12px; max-height:240px; overflow-y:auto; }
+        .step-item {
+            display:flex; align-items:center; gap:8px;
+            background:#0d0d0d; border:1px solid #1f1f1f; border-radius:6px;
+            padding:7px 10px; font-size:13px; color:#ccc;
+        }
+        .step-item.active { border-color:#f59e0b; color:#fff; background:#1a1407; }
+        .step-item .num { color:#555; font-size:11px; width:18px; flex-shrink:0; }
+        .step-item .desc { flex:1; }
+        .step-item .ico-btn { background:none; border:none; color:#666; cursor:pointer; font-size:13px; padding:2px 4px; }
+        .step-item .ico-btn:hover { color:#fff; }
+        .empty-hint { color:#444; font-size:12px; padding:8px 0; }
     </style>
 </head>
 <body>
@@ -226,25 +354,72 @@ def index():
     <div class="layout">
         <img src="/video">
 
-        <div class="mission-panel">
-            <h3>Auto Mission</h3>
+        <div class="side-col">
 
-            <div class="mission-steps">
-                <div class="step"><div class="step-icon">🛫</div> Takeoff</div>
-                <div class="step"><div class="step-icon">⬆️</div> Ascend 5 m</div>
-                <div class="step"><div class="step-icon">↩️</div> Square (turn left)</div>
-                <div class="step"><div class="step-icon">🛬</div> Land</div>
-            </div>
+            <div class="panel">
+                <h3>Manual Control</h3>
+                <div class="pad">
+                    <button class="btn takeoff" onclick="ctrl('takeoff')">🛫 Takeoff</button>
+                    <button class="btn" onclick="ctrl('up')">⬆ Up</button>
+                    <button class="btn land" onclick="ctrl('land')">🛬 Land</button>
 
-            <button class="btn-mission" id="missionBtn" onclick="startMission()">▶ Run Mission</button>
+                    <button class="btn" onclick="ctrl('ccw')">⟲ CCW</button>
+                    <button class="btn" onclick="ctrl('forward')">▲ Fwd</button>
+                    <button class="btn" onclick="ctrl('cw')">⟳ CW</button>
 
-            <div>
-                <div style="font-size:11px;color:#555;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.08em;">
-                    <span class="status-dot" id="statusDot"></span>
-                    <span id="statusText">Idle</span>
+                    <button class="btn" onclick="ctrl('left')">◀ Left</button>
+                    <button class="btn" onclick="ctrl('back')">▼ Back</button>
+                    <button class="btn" onclick="ctrl('right')">▶ Right</button>
+
+                    <button class="btn" onclick="ctrl('flip','f')">⤿ Flip</button>
+                    <button class="btn" onclick="ctrl('down')">⬇ Down</button>
+                    <div class="spacer"></div>
                 </div>
-                <div class="log-box" id="logBox">Waiting...</div>
+                <div class="manual-val">
+                    move <input type="number" id="manualDist" value="30" min="20" max="500"> cm
+                    · turn <input type="number" id="manualAng" value="45" min="1" max="360"> °
+                </div>
+                <div class="kbd-hint">keys: T takeoff · G land · W/S fwd/back · A/D left/right · R/F up/down · Q/E rotate</div>
             </div>
+
+            <div class="panel">
+                <h3>Mission Builder</h3>
+                <div class="builder-row">
+                    <select id="cmdType" onchange="onTypeChange()">
+                        <option value="takeoff">Takeoff</option>
+                        <option value="up">Up (cm)</option>
+                        <option value="down">Down (cm)</option>
+                        <option value="forward">Forward (cm)</option>
+                        <option value="back">Back (cm)</option>
+                        <option value="left">Left (cm)</option>
+                        <option value="right">Right (cm)</option>
+                        <option value="cw">Rotate CW (deg)</option>
+                        <option value="ccw">Rotate CCW (deg)</option>
+                        <option value="flip">Flip (l/r/f/b)</option>
+                        <option value="wait">Wait (s)</option>
+                        <option value="land">Land</option>
+                    </select>
+                    <input type="text" id="cmdVal" placeholder="val">
+                    <button class="btn btn-add" onclick="addStep()">+ Add</button>
+                </div>
+
+                <div class="steps-list" id="stepsList"></div>
+
+                <button class="btn-mission" id="missionBtn" onclick="runMission()">▶ Run Mission</button>
+                <div style="display:flex;gap:8px;margin-top:8px;">
+                    <button class="btn" style="flex:1" onclick="loadSquare()">↺ Square preset</button>
+                    <button class="btn" style="flex:1" onclick="clearSteps()">✕ Clear</button>
+                </div>
+
+                <div style="margin-top:12px;">
+                    <div style="font-size:11px;color:#555;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.08em;">
+                        <span class="status-dot" id="statusDot"></span>
+                        <span id="statusText">Idle</span>
+                    </div>
+                    <div class="log-box" id="logBox">Waiting...</div>
+                </div>
+            </div>
+
         </div>
     </div>
 
@@ -262,29 +437,147 @@ def index():
             document.getElementById('barometer').innerHTML  = d.barometer  + '<span class="unit">cm</span>';
         }
 
+        // ---- manual control ----
+        const MOVE = ['up','down','forward','back','left','right'];
+        const ROT  = ['cw','ccw'];
+
+        function ctrl(cmd, val) {
+            let url = '/control/' + cmd;
+            if (val !== undefined)        url += '?value=' + encodeURIComponent(val);
+            else if (MOVE.includes(cmd))  url += '?value=' + document.getElementById('manualDist').value;
+            else if (ROT.includes(cmd))   url += '?value=' + document.getElementById('manualAng').value;
+            fetch(url, { method: 'POST' }).catch(() => {});
+        }
+
+        const KEYMAP = { t:'takeoff', g:'land', w:'forward', s:'back',
+                         a:'left', d:'right', r:'up', f:'down', q:'ccw', e:'cw' };
+        document.addEventListener('keydown', (ev) => {
+            const tag = ev.target.tagName;
+            if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+            const cmd = KEYMAP[ev.key.toLowerCase()];
+            if (cmd) { ev.preventDefault(); ctrl(cmd); }
+        });
+
+        // ---- mission builder ----
+        let steps = [];
+        const TYPE_META = {
+            takeoff:{v:false}, land:{v:false},
+            up:{v:true,def:50}, down:{v:true,def:50},
+            forward:{v:true,def:50}, back:{v:true,def:50},
+            left:{v:true,def:50}, right:{v:true,def:50},
+            cw:{v:true,def:90}, ccw:{v:true,def:90},
+            flip:{v:true,def:'f'}, wait:{v:true,def:2},
+        };
+        const LBL = { takeoff:'Takeoff',land:'Land',up:'Up',down:'Down',
+            forward:'Forward',back:'Back',left:'Left',right:'Right',
+            cw:'Rotate CW',ccw:'Rotate CCW',flip:'Flip',wait:'Wait' };
+
+        function onTypeChange() {
+            const t = document.getElementById('cmdType').value;
+            const inp = document.getElementById('cmdVal');
+            const m = TYPE_META[t];
+            if (m.v) { inp.style.visibility = 'visible'; inp.value = m.def; }
+            else     { inp.style.visibility = 'hidden';  inp.value = ''; }
+        }
+
+        function descOf(s) {
+            const n = LBL[s.type] || s.type;
+            if (s.type === 'takeoff' || s.type === 'land') return n;
+            if (s.type === 'flip') return n + ' ' + s.value;
+            if (s.type === 'wait') return n + ' ' + s.value + 's';
+            const unit = ROT.includes(s.type) ? '°' : 'cm';
+            return n + ' ' + s.value + unit;
+        }
+
+        function renderSteps(current) {
+            const box = document.getElementById('stepsList');
+            if (!steps.length) {
+                box.innerHTML = '<div class="empty-hint">No steps. Add commands above.</div>';
+                return;
+            }
+            box.innerHTML = steps.map((s, i) =>
+                '<div class="step-item ' + (i === current ? 'active' : '') + '">' +
+                    '<span class="num">' + (i + 1) + '</span>' +
+                    '<span class="desc">' + descOf(s) + '</span>' +
+                    '<button class="ico-btn" onclick="moveStep(' + i + ',-1)">▲</button>' +
+                    '<button class="ico-btn" onclick="moveStep(' + i + ',1)">▼</button>' +
+                    '<button class="ico-btn" onclick="removeStep(' + i + ')">✕</button>' +
+                '</div>').join('');
+        }
+
+        function addStep() {
+            const t = document.getElementById('cmdType').value;
+            const m = TYPE_META[t];
+            const step = { type: t };
+            if (m.v) {
+                const val = document.getElementById('cmdVal').value.trim();
+                if (t === 'flip') {
+                    if (!['l','r','f','b'].includes(val)) { alert('flip needs l/r/f/b'); return; }
+                    step.value = val;
+                } else {
+                    if (val === '' || isNaN(val)) { alert('enter a number'); return; }
+                    step.value = Number(val);
+                }
+            }
+            steps.push(step);
+            renderSteps(-1);
+        }
+
+        function removeStep(i) { steps.splice(i, 1); renderSteps(-1); }
+        function moveStep(i, d) {
+            const j = i + d;
+            if (j < 0 || j >= steps.length) return;
+            [steps[i], steps[j]] = [steps[j], steps[i]];
+            renderSteps(-1);
+        }
+        function clearSteps() { steps = []; renderSteps(-1); }
+
+        function loadSquare() {
+            steps = [ {type:'takeoff'}, {type:'up',value:100} ];
+            for (let i = 0; i < 4; i++) {
+                steps.push({type:'forward', value:100});
+                steps.push({type:'ccw', value:90});
+            }
+            steps.push({type:'land'});
+            renderSteps(-1);
+        }
+
+        async function runMission() {
+            if (!steps.length) { alert('add steps first'); return; }
+            const res = await fetch('/mission/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ steps })
+            });
+            if (!res.ok) {
+                const d = await res.json().catch(() => ({}));
+                alert(d.msg || 'mission error');
+            }
+        }
+
         async function pollMission() {
             const res = await fetch('/mission/status');
             const d = await res.json();
-            const btn  = document.getElementById('missionBtn');
-            const dot  = document.getElementById('statusDot');
-            const txt  = document.getElementById('statusText');
-            const log  = document.getElementById('logBox');
+            const btn = document.getElementById('missionBtn');
+            const dot = document.getElementById('statusDot');
+            const txt = document.getElementById('statusText');
+            const log = document.getElementById('logBox');
 
             btn.disabled = d.running;
             btn.textContent = d.running ? '⏳ Running...' : '▶ Run Mission';
-            dot.className  = 'status-dot' + (d.running ? ' running' : '');
+            dot.className = 'status-dot' + (d.running ? ' running' : '');
             txt.textContent = d.running ? 'Running' : 'Idle';
 
-            if (d.log.length) {
+            renderSteps(d.running ? d.current : -1);
+
+            if (d.log && d.log.length) {
                 log.innerHTML = d.log.map(l => '<div>' + l + '</div>').join('');
                 log.scrollTop = log.scrollHeight;
             }
         }
 
-        async function startMission() {
-            await fetch('/mission/start', { method: 'POST' });
-        }
-
+        onTypeChange();
+        renderSteps(-1);
         setInterval(updateStats, 1000);
         setInterval(pollMission, 800);
         updateStats();
