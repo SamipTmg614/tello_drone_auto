@@ -3,6 +3,8 @@ from flask import Flask, Response, jsonify, request
 import cv2
 import threading
 import time
+import os
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -11,28 +13,47 @@ tello.connect()
 tello.streamon()
 frame_reader = tello.get_frame_read()
 
+# ---- Recording state ------------------------------------------------------
+record_state = {"active": False, "writer": None, "filename": None, "lock": threading.Lock()}
+
+RECORD_DIR = "recordings"
+os.makedirs(RECORD_DIR, exist_ok=True)
+
+def start_recording(frame):
+    h, w = frame.shape[:2]
+    fname = os.path.join(RECORD_DIR, datetime.now().strftime("rec_%Y%m%d_%H%M%S.avi"))
+    writer = cv2.VideoWriter(fname, cv2.VideoWriter_fourcc(*'XVID'), 30, (w, h))
+    record_state["writer"] = writer
+    record_state["filename"] = fname
+    record_state["active"] = True
+    log(f"Recording started: {fname}")
+
+def stop_recording():
+    with record_state["lock"]:
+        if record_state["writer"]:
+            record_state["writer"].release()
+            record_state["writer"] = None
+        record_state["active"] = False
+        fname = record_state["filename"]
+        record_state["filename"] = None
+    log(f"Recording saved: {fname}")
+
 # ---- Mission engine -------------------------------------------------------
 mission_status = {"running": False, "log": [], "current": -1, "cancel": False}
 mission_lock = threading.Lock()
 
-# Let the drone settle after takeoff before the next move so the climb is stable.
-# Firing a move ~0.3s after takeoff (before position hold locks) is what makes it
-# lurch/drift backward instead of climbing cleanly.
-STABILIZE_AFTER_TAKEOFF = 4      # seconds
-MISSION_SPEED = 40               # cm/s for distance moves — gentler = more predictable
-MAX_MOVE_CHUNK = 100             # split big moves into ≤this many cm — large single hops are flaky
-MOVE_RETRIES   = 2               # retries (after a settle) on transient errors like 'No valid imu'
-RETRY_SETTLE   = 1.5             # seconds to let the IMU steady before a retry
-MIN_BATTERY    = 20              # refuse to start a mission below this %
+STABILIZE_AFTER_TAKEOFF = 4
+MISSION_SPEED = 40
+MAX_MOVE_CHUNK = 250
+MOVE_RETRIES   = 2
+RETRY_SETTLE   = 1.5
+MIN_BATTERY    = 20
 
-# Fallback for a stubborn 'No valid imu': precise move_* needs a valid position
-# estimate (IMU + downward vision); send_rc_control is open-loop velocity and does
-# not, so it usually still flies. Distance/angle become APPROXIMATE (time-based).
-USE_RC_FALLBACK = True            # set False to just abort instead of flying open-loop
-RC_SPEED        = 30             # rc throttle 0-100 for fallback moves (conservative)
-RC_CM_PER_S     = 30             # APPROX cm/sec at RC_SPEED  — TUNE to your drone
-RC_DEG_PER_S    = 45             # APPROX deg/sec at RC_SPEED — TUNE to your drone
-RC_AXES = {                      # direction -> (left_right, fwd_back, up_down, yaw) signs
+USE_RC_FALLBACK = True
+RC_SPEED        = 30
+RC_CM_PER_S     = 30
+RC_DEG_PER_S    = 45
+RC_AXES = {
     "up": (0, 0, 1, 0),   "down": (0, 0, -1, 0),
     "forward": (0, 1, 0, 0),  "back": (0, -1, 0, 0),
     "left": (-1, 0, 0, 0),  "right": (1, 0, 0, 0),
@@ -45,7 +66,6 @@ def log(msg):
     if len(mission_status["log"]) > 40:
         mission_status["log"].pop(0)
 
-# command tables: map a step "type" to the drone action
 MOVE_CMDS = {
     "up": tello.move_up, "down": tello.move_down,
     "forward": tello.move_forward, "back": tello.move_back,
@@ -94,9 +114,6 @@ def validate_steps(steps):
     return None
 
 def _rc_move(direction, amount, per_sec):
-    """Open-loop velocity move/turn via send_rc_control — bypasses the position
-    estimator that rejects precise commands with 'No valid imu'. Distance/angle is
-    APPROXIMATE (time-based), so tune RC_CM_PER_S / RC_DEG_PER_S to your drone."""
     lr, fb, ud, yaw = RC_AXES[direction]
     s = RC_SPEED
     dur = amount / max(1, per_sec)
@@ -104,15 +121,12 @@ def _rc_move(direction, amount, per_sec):
     end = time.time() + dur
     while time.time() < end:
         if mission_status.get("cancel"):
-            return                                # operator stop — let land take over
+            return
         tello.send_rc_control(lr * s, fb * s, ud * s, yaw * s)
         time.sleep(0.05)
-    tello.send_rc_control(0, 0, 0, 0)             # normal finish: stop & hover
+    tello.send_rc_control(0, 0, 0, 0)
 
 def _do_with_retry(direction, amount, per_sec):
-    """Precise move/rotate with settle-and-retry on transient errors, then (if
-    enabled) an open-loop rc fallback so a stubborn 'No valid imu' that calibration
-    can't fix doesn't kill the mission. Re-raises if the fallback is disabled."""
     precise = MOVE_CMDS.get(direction) or ROTATE_CMDS.get(direction)
     for attempt in range(MOVE_RETRIES + 1):
         try:
@@ -139,10 +153,9 @@ def exec_step(step):
     elif t == "land":
         tello.land()
     elif t == "emergency":
-        tello.emergency()          # cuts motors immediately — drone drops
+        tello.emergency()
     elif t in MOVE_CMDS:
-        dist = max(20, min(500, int(float(v))))           # Tello range 20-500 cm
-        # split into even hops of ≤MAX_MOVE_CHUNK; each hop re-stabilizes (IMU-friendly)
+        dist = max(20, min(500, int(float(v))))
         n = (dist + MAX_MOVE_CHUNK - 1) // MAX_MOVE_CHUNK
         base, extra = divmod(dist, n)
         for k in range(n):
@@ -150,9 +163,9 @@ def exec_step(step):
                 return
             _do_with_retry(t, base + (1 if k < extra else 0), RC_CM_PER_S)
             if k < n - 1:
-                time.sleep(0.4)                            # brief settle between hops
+                time.sleep(0.4)
     elif t in ROTATE_CMDS:
-        _do_with_retry(t, max(1, min(360, int(float(v)))), RC_DEG_PER_S)   # 1-360 deg
+        _do_with_retry(t, max(1, min(360, int(float(v)))), RC_DEG_PER_S)
     elif t == "flip":
         if v not in FLIP_DIRS:
             raise ValueError(f"bad flip dir '{v}'")
@@ -163,12 +176,9 @@ def exec_step(step):
         raise ValueError(f"unknown step '{t}'")
 
 def abort_mission(stop_cmd="land"):
-    """Signal a running mission to stop and immediately fire a stop command to
-    the drone WITHOUT waiting for a response — so it works even while the mission
-    thread is blocked mid-move. Backs the emergency Land button."""
     mission_status["cancel"] = True
     try:
-        tello.send_command_without_return(stop_cmd)   # 'land' (controlled) or 'emergency' (motor cut)
+        tello.send_command_without_return(stop_cmd)
         log(f"!! Operator override: {stop_cmd.upper()}")
     except Exception as e:
         log(f"abort send failed: {e}")
@@ -192,7 +202,7 @@ def run_mission(steps):
         except Exception as e:
             log(f"battery check failed: {e}")
         try:
-            tello.set_speed(MISSION_SPEED)            # gentle, predictable moves
+            tello.set_speed(MISSION_SPEED)
         except Exception:
             pass
         for i, step in enumerate(steps):
@@ -202,7 +212,6 @@ def run_mission(steps):
             mission_status["current"] = i
             log(f"[{i + 1}/{len(steps)}] {step_desc(step)}")
             exec_step(step)
-            # settle after takeoff so the next move (the climb) is stable, not a lurch
             if step.get("type") == "takeoff":
                 log(f"stabilizing {STABILIZE_AFTER_TAKEOFF}s...")
                 time.sleep(STABILIZE_AFTER_TAKEOFF)
@@ -214,7 +223,6 @@ def run_mission(steps):
             log("Mission complete.")
     except Exception as e:
         log(f"Mission error: {e}")
-        # don't fight an operator stop — only auto-land if no abort was requested
         if not mission_status["cancel"]:
             try:
                 tello.land()
@@ -227,18 +235,54 @@ def run_mission(steps):
         mission_status["cancel"] = False
         mission_lock.release()
 
+# ---- Video stream ---------------------------------------------------------
 def gen_frames():
     while True:
         frame = frame_reader.frame
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        _, buffer = cv2.imencode('.jpg', frame)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Write to recorder if active
+        with record_state["lock"]:
+            if record_state["active"] and record_state["writer"]:
+                record_state["writer"].write(rgb)
+
+        # Overlay REC indicator on the stream
+        if record_state["active"]:
+            cv2.circle(rgb, (20, 20), 8, (0, 0, 255), -1)
+            cv2.putText(rgb, "REC", (34, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        _, buffer = cv2.imencode('.jpg', rgb)
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' +
                buffer.tobytes() + b'\r\n')
 
+# ---- Routes ---------------------------------------------------------------
 @app.route('/video')
 def video():
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/record/toggle', methods=['POST'])
+def record_toggle():
+    with record_state["lock"]:
+        currently = record_state["active"]
+
+    if currently:
+        stop_recording()
+        return jsonify({"recording": False, "file": record_state["filename"] or ""})
+    else:
+        # Need a frame to get resolution
+        frame = frame_reader.frame
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        with record_state["lock"]:
+            start_recording(rgb)
+        return jsonify({"recording": True, "file": record_state["filename"]})
+
+@app.route('/record/status')
+def record_status():
+    return jsonify({
+        "recording": record_state["active"],
+        "filename": record_state["filename"] or ""
+    })
 
 @app.route('/stats')
 def stats():
@@ -279,17 +323,15 @@ def abort_route():
 def control(cmd):
     if cmd not in ALL_TYPES:
         return jsonify({"status": "error", "msg": f"unknown cmd '{cmd}'"}), 400
-    # Safety override: Land / Emergency may interrupt a running mission at ANY time.
     if cmd in ("land", "emergency"):
         if mission_status["running"]:
             abort_mission(cmd)
             return jsonify({"status": "aborting", "msg": f"{cmd} sent — mission aborting"})
         try:
-            exec_step({"type": cmd})                # not in a mission: normal blocking land
+            exec_step({"type": cmd})
             return jsonify({"status": "ok"})
         except Exception as e:
             return jsonify({"status": "error", "msg": str(e)}), 500
-    # Every other manual command is blocked while a mission is running.
     if mission_status["running"]:
         return jsonify({"status": "busy", "msg": "mission running — only Land/Emergency allowed"}), 409
     v = request.args.get("value")
@@ -345,7 +387,56 @@ def index():
 
         .layout { display:grid; grid-template-columns:1fr 380px; gap:16px; align-items:start; }
 
-        img { width:100%; border-radius:10px; border:1px solid #222; display:block; }
+        .video-wrap { position:relative; }
+        .video-wrap img { width:100%; border-radius:10px; border:1px solid #222; display:block; }
+
+        /* Record button overlaid on video */
+        .btn-record {
+            position:absolute;
+            top:10px; right:10px;
+            background:rgba(20,20,20,0.85);
+            border:1px solid #333;
+            border-radius:8px;
+            padding:8px 14px;
+            color:#e0e0e0;
+            font-size:13px;
+            font-weight:600;
+            cursor:pointer;
+            display:flex;
+            align-items:center;
+            gap:8px;
+            transition:background .15s, border-color .15s;
+            backdrop-filter:blur(4px);
+        }
+        .btn-record:hover { background:rgba(40,40,40,0.95); border-color:#555; }
+        .btn-record.recording { border-color:#ef4444; color:#ef4444; }
+        .btn-record.recording:hover { background:rgba(60,10,10,0.95); }
+        .rec-dot {
+            width:9px; height:9px;
+            border-radius:50%;
+            background:#555;
+            flex-shrink:0;
+            transition:background .15s;
+        }
+        .btn-record.recording .rec-dot {
+            background:#ef4444;
+            animation:blink 1s infinite;
+        }
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+        .rec-filename {
+            position:absolute;
+            bottom:10px; left:10px;
+            background:rgba(0,0,0,0.7);
+            border-radius:6px;
+            padding:4px 10px;
+            font-size:11px;
+            font-family:monospace;
+            color:#ef4444;
+            display:none;
+            backdrop-filter:blur(4px);
+        }
+        .rec-filename.visible { display:block; }
 
         .mission-panel {
             background:#161616;
@@ -357,28 +448,6 @@ def index():
             gap:14px;
         }
         .mission-panel h3 { font-size:13px; color:#666; text-transform:uppercase; letter-spacing:0.08em; }
-
-        .mission-steps {
-            display:flex;
-            flex-direction:column;
-            gap:8px;
-        }
-        .step {
-            display:flex;
-            align-items:center;
-            gap:10px;
-            font-size:13px;
-            color:#888;
-        }
-        .step-icon {
-            width:28px; height:28px;
-            border-radius:50%;
-            background:#1e1e1e;
-            border:1px solid #2a2a2a;
-            display:flex; align-items:center; justify-content:center;
-            font-size:14px;
-            flex-shrink:0;
-        }
 
         .btn-mission {
             background:#2563eb;
@@ -395,7 +464,6 @@ def index():
         .btn-mission:hover  { background:#1d4ed8; }
         .btn-mission:disabled { background:#1e3a6e; color:#555; cursor:not-allowed; }
 
-        /* always-on safety controls */
         .btn-emergency {
             margin-top:10px; width:100%; padding:14px;
             background:#dc2626; color:#fff; border:none; border-radius:8px;
@@ -436,18 +504,15 @@ def index():
         .status-dot.running { background:#f59e0b; animation:pulse 1s infinite; }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
-        /* side column: stacked panels */
         .side-col { display:flex; flex-direction:column; gap:16px; }
         .panel { background:#161616; border:1px solid #222; border-radius:10px; padding:16px; }
         .panel h3 { font-size:13px; color:#666; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:12px; }
 
-        /* generic small button */
         .btn { border:none; border-radius:6px; padding:8px 10px; font-size:13px; font-weight:600; cursor:pointer; color:#fff; background:#333; transition:background .15s; }
         .btn:hover { background:#444; }
         .btn-add { background:#374151; }
         .btn-add:hover { background:#4b5563; }
 
-        /* manual control pad */
         .pad { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
         .pad .btn { padding:11px 0; background:#1e1e1e; }
         .pad .btn:hover { background:#2a2a2a; }
@@ -460,7 +525,6 @@ def index():
         .manual-val input { width:60px; background:#0d0d0d; border:1px solid #2a2a2a; color:#e0e0e0; border-radius:6px; padding:6px; }
         .kbd-hint { font-size:11px; color:#444; margin-top:10px; line-height:1.6; }
 
-        /* mission builder */
         .builder-row { display:flex; gap:6px; margin-bottom:10px; }
         .builder-row select, .builder-row input {
             background:#0d0d0d; border:1px solid #2a2a2a; color:#e0e0e0;
@@ -498,7 +562,14 @@ def index():
     </div>
 
     <div class="layout">
-        <img src="/video">
+        <div class="video-wrap">
+            <img src="/video">
+            <button class="btn-record" id="recBtn" onclick="toggleRecord()">
+                <span class="rec-dot"></span>
+                <span id="recLabel">Record</span>
+            </button>
+            <div class="rec-filename" id="recFilename"></div>
+        </div>
 
         <div class="side-col">
 
@@ -525,7 +596,7 @@ def index():
                     move <input type="number" id="manualDist" value="30" min="20" max="500"> cm
                     · turn <input type="number" id="manualAng" value="45" min="1" max="360"> °
                 </div>
-                <div class="kbd-hint">keys: T takeoff · G land/abort · W/S fwd/back · A/D left/right · R/F up/down · Q/E rotate<br>Land &amp; Emergency work during a mission; other manual moves are paused while it runs.</div>
+                <div class="kbd-hint">keys: T takeoff · G land/abort · W/S fwd/back · A/D left/right · R/F up/down · Q/E rotate · V record<br>Land &amp; Emergency work during a mission; other manual moves are paused while it runs.</div>
             </div>
 
             <div class="panel">
@@ -572,6 +643,7 @@ def index():
     </div>
 
     <script>
+        // ---- Stats ----
         async function updateStats() {
             const res = await fetch('/stats');
             const d = await res.json();
@@ -585,7 +657,41 @@ def index():
             document.getElementById('barometer').innerHTML  = d.barometer  + '<span class="unit">cm</span>';
         }
 
-        // ---- manual control ----
+        // ---- Record ----
+        let isRecording = false;
+
+        async function toggleRecord() {
+            const res = await fetch('/record/toggle', { method: 'POST' });
+            const d = await res.json();
+            setRecordUI(d.recording, d.file);
+        }
+
+        function setRecordUI(recording, filename) {
+            isRecording = recording;
+            const btn = document.getElementById('recBtn');
+            const label = document.getElementById('recLabel');
+            const fnEl = document.getElementById('recFilename');
+
+            btn.classList.toggle('recording', recording);
+            label.textContent = recording ? 'Stop' : 'Record';
+
+            if (recording && filename) {
+                // Show just the filename, not the full path
+                const parts = filename.replace(/\\/g, '/').split('/');
+                fnEl.textContent = '● ' + parts[parts.length - 1];
+                fnEl.classList.add('visible');
+            } else {
+                fnEl.classList.remove('visible');
+            }
+        }
+
+        async function pollRecord() {
+            const res = await fetch('/record/status');
+            const d = await res.json();
+            setRecordUI(d.recording, d.filename);
+        }
+
+        // ---- Manual control ----
         const MOVE = ['up','down','forward','back','left','right'];
         const ROT  = ['cw','ccw'];
 
@@ -602,11 +708,12 @@ def index():
         document.addEventListener('keydown', (ev) => {
             const tag = ev.target.tagName;
             if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+            if (ev.key.toLowerCase() === 'v') { ev.preventDefault(); toggleRecord(); return; }
             const cmd = KEYMAP[ev.key.toLowerCase()];
             if (cmd) { ev.preventDefault(); ctrl(cmd); }
         });
 
-        // ---- mission builder ----
+        // ---- Mission builder ----
         let steps = [];
         const TYPE_META = {
             takeoff:{v:false}, land:{v:false},
@@ -680,14 +787,13 @@ def index():
         }
         function clearSteps() { steps = []; renderSteps(-1); }
 
-        // Auto mission: takeoff → climb 200cm → trace a 200cm square (turning left) → descend → land
         function loadSquare() {
-            steps = [ {type:'takeoff'}, {type:'up', value:200} ];
+            steps = [ {type:'takeoff'}, {type:'up', value:500} ];
             for (let i = 0; i < 4; i++) {
                 steps.push({type:'forward', value:200});
-                if (i < 3) steps.push({type:'ccw', value:90});   // turn left at the first 3 corners
+                if (i < 3) steps.push({type:'ccw', value:90});
             }
-            steps.push({type:'down', value:200});
+            steps.push({type:'down', value:500});
             steps.push({type:'land'});
             renderSteps(-1);
         }
@@ -705,7 +811,6 @@ def index():
             }
         }
 
-        // Emergency stop — works whether or not a mission is running (backend aborts + lands).
         async function emergencyLand() {
             try { await fetch('/control/land', { method: 'POST' }); } catch (e) {}
         }
@@ -739,8 +844,10 @@ def index():
         renderSteps(-1);
         setInterval(updateStats, 1000);
         setInterval(pollMission, 800);
+        setInterval(pollRecord, 2000);
         updateStats();
         pollMission();
+        pollRecord();
     </script>
 </body>
 </html>
