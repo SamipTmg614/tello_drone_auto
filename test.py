@@ -676,8 +676,10 @@ def index():
             label.textContent = recording ? 'Stop' : 'Record';
 
             if (recording && filename) {
-                // Show just the filename, not the full path
-                const parts = filename.replace(/\\/g, '/').split('/');
+                // Show just the filename, not the full path.
+                // NOTE: this whole page is a non-raw Python string, so backslashes
+                // must be doubled in the source — the browser receives /\\/g here.
+                const parts = filename.replace(/\\\\/g, '/').split('/');
                 fnEl.textContent = '● ' + parts[parts.length - 1];
                 fnEl.classList.add('visible');
             } else {
@@ -854,5 +856,7 @@ def index():
 '''
 
 if __name__ == '__main__':
-    print('Dashboard at: http://10.197.206.2:5000')
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    # 5000 is taken by macOS AirPlay Receiver (Control Center); override with PORT env var.
+    PORT = int(os.environ.get('PORT', 5050))
+    print(f'Dashboard at: http://10.197.206.2:{PORT}')
+    app.run(host='0.0.0.0', port=PORT, threaded=True)
