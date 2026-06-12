@@ -187,40 +187,33 @@ def run_mission(steps):
     if not mission_lock.acquire(blocking=False):
         log("Mission already running.")
         return
+    mission_status["running"] = True
+    mission_status["log"] = []
     try:
-        mission_status["running"] = True
-        mission_status["cancel"] = False
-        mission_status["log"] = []
-        mission_status["current"] = -1
-        log(f"Mission start — {len(steps)} step(s)")
-        try:
-            batt = tello.get_battery()
-            log(f"Battery {batt}%")
-            if batt < MIN_BATTERY:
-                log(f"Battery < {MIN_BATTERY}% — aborting. Charge before flying.")
-                return
-        except Exception as e:
-            log(f"battery check failed: {e}")
-        try:
-            tello.set_speed(MISSION_SPEED)
-        except Exception:
-            pass
-        for i, step in enumerate(steps):
-            if mission_status["cancel"]:
-                log("Mission aborted by operator.")
-                break
-            mission_status["current"] = i
-            log(f"[{i + 1}/{len(steps)}] {step_desc(step)}")
-            exec_step(step)
-            if step.get("type") == "takeoff":
-                log(f"stabilizing {STABILIZE_AFTER_TAKEOFF}s...")
-                time.sleep(STABILIZE_AFTER_TAKEOFF)
-            if mission_status["cancel"]:
-                log("Mission aborted by operator.")
-                break
-            time.sleep(0.3)
-        else:
-            log("Mission complete.")
+        log("Takeoff...")
+        tello.takeoff()
+        time.sleep(3)
+
+        log("Ascending to 500 cm (5 m)...")
+        tello.move_up(500)
+        time.sleep(4)
+
+        # Fly a square, turning LEFT at each corner (first turn is left)
+        side = 100  # cm per side
+        for i in range(4):
+            log(f"Square side {i + 1}/4: forward {side} cm...")
+            tello.move_forward(side)
+            time.sleep(3)
+
+            log(f"Corner {i + 1}/4: turning left 90 deg...")
+            tello.rotate_counter_clockwise(90)
+            time.sleep(2)
+
+        log("Landing...")
+        tello.land()
+        time.sleep(3)
+
+        log("Mission complete.")
     except Exception as e:
         log(f"Mission error: {e}")
         if not mission_status["cancel"]:
