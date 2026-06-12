@@ -28,6 +28,7 @@ app = Flask(__name__)
 tello = Tello()
 tello.connect()
 tello.streamon()
+time.sleep(2)   # wait for drone to start sending video frames
 frame_reader = tello.get_frame_read()
 
 # ---- Recording ------------------------------------------------------------
